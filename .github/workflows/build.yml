@@ -1,0 +1,339 @@
+name: Build Lightweight Physics Chatbot EXE (No RAG) & Upload to Drive
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  DRIVE_FOLDER_ID: "1zmZ63MZVWkpMPagZ6FEGVEgB7UkMiaIT"
+  MODEL_DIR: "models"
+  MODEL_FILENAME: "PhysicsChatbot.gguf"
+  MODEL_URL: "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf?download=true" 
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  build-windows-exe:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+      # -------------------------------------------------
+      # 1. Checkout + Submodules + Python
+      # -------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive  # Ensures any git submodules are pulled
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # -------------------------------------------------
+      # 2. Cache pip & Python path fix
+      # -------------------------------------------------
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}-${{ env.PYTHON_VERSION }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Set PYTHONPATH to fix import errors
+        run: |
+          echo "PYTHONPATH=$GITHUB_WORKSPACE" >> $env:GITHUB_ENV
+          echo "PYTHONPATH=$GITHUB_WORKSPACE" >> $env:GITHUB_PATH
+        shell: powershell
+
+      # -------------------------------------------------
+      # 3. Install dependencies (lightweight, no RAG)
+      # -------------------------------------------------
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          
+          # Core FastAPI + DB + Auth
+          pip install fastapi uvicorn sqlalchemy passlib[bcrypt] python-jose[cryptography] python-multipart
+          
+          # LLM: llama-cpp-python (prebuilt CPU binary)
+          pip install llama-cpp-python --only-binary=:all: --no-deps
+          
+          # PyInstaller + Google Drive
+          pip install pyinstaller google-api-python-client google-auth-httplib2 google-auth-oauthlib
+          
+          # Optional: Add any missing from imports
+          pip install pydantic
+
+      # -------------------------------------------------
+      # 4. Extract llama_cpp DLLs (critical for PyInstaller)
+      # -------------------------------------------------
+      - name: Extract llama_cpp Windows DLLs
+        shell: bash
+        run: |
+          python - <<EOF
+          import subprocess
+          import sys
+          import os
+          import shutil
+          import glob
+
+          # Get install location
+          result = subprocess.run(
+              [sys.executable, "-m", "pip", "show", "llama-cpp-python"],
+              capture_output=True, text=True, check=True
+          )
+          location = None
+          for line in result.stdout.splitlines():
+              if line.startswith("Location:"):
+                  location = line.split(":", 1)[1].strip()
+                  break
+          if not location:
+              raise RuntimeError("Could not find llama-cpp-python location")
+
+          print(f"llama-cpp-python installed at: {location}")
+
+          # Find package dir
+          pkg_paths = glob.glob(os.path.join(location, "llama_cpp*"))
+          if not pkg_paths:
+              raise FileNotFoundError("llama_cpp package not found")
+          pkg_path = pkg_paths[0]
+
+          src_lib = os.path.join(pkg_path, "lib")
+          if not os.path.exists(src_lib):
+              raise FileNotFoundError(f"lib/ directory not found in {pkg_path}")
+
+          target_lib = "llama_cpp/lib"
+          os.makedirs(os.path.dirname(target_lib), exist_ok=True)
+          shutil.copytree(src_lib, target_lib, dirs_exist_ok=True)
+          print(f"DLLs copied to {target_lib}")
+          EOF
+
+      # -------------------------------------------------
+      # 5. Download LLM Model (GGUF)
+      # -------------------------------------------------
+      - name: Download PhysicsChatbot GGUF Model
+        shell: bash
+        run: |
+          mkdir -p ${{ env.MODEL_DIR }}
+          if [ ! -f "${{ env.MODEL_DIR }}/${{ env.MODEL_FILENAME }}" ]; then
+            echo "Downloading model from ${{ env.MODEL_URL }}..."
+            curl -L -o "${{ env.MODEL_DIR }}/${{ env.MODEL_FILENAME }}" "${{ env.MODEL_URL }}"
+            echo "Model downloaded."
+          else
+            echo "Model already exists."
+          fi
+
+      # -------------------------------------------------
+      # 6. Create data directories (required at runtime)
+      # -------------------------------------------------
+      - name: Create runtime directories
+        shell: bash
+        run: |
+          mkdir -p data/logs data/memory data
+          echo "Runtime directories created."
+
+      # -------------------------------------------------
+      # 7. Generate PyInstaller Spec (Lightweight)
+      # -------------------------------------------------
+      - name: Generate PyInstaller Spec File
+        shell: bash
+        run: |
+          cat > FullServer.spec << 'EOF'
+          # -*- mode: python ; coding: utf-8 -*-
+          import os
+
+          block_cipher = None
+
+          a = Analysis(
+              ['FullServer.py'],
+              pathex=['.'],  # Critical: include current dir
+              binaries=[],
+              datas=[
+                  ('models', 'models'),  # GGUF model
+                  ('chat_utils.py', '.'),
+                  ('chat_llm_service.py', '.'),
+                  ('memory_manager.py', '.'),
+                  ('tech_support_logger.py', '.'),
+                  ('llama_cpp/lib', 'llama_cpp/lib'),  # DLLs
+                  ('data', 'data'),  # Empty data dir for DB/logs
+              ],
+              hiddenimports=[
+                  'uvicorn.logging',
+                  'uvicorn.loops',
+                  'uvicorn.loops.auto',
+                  'uvicorn.protocols',
+                  'uvicorn.protocols.http',
+                  'uvicorn.protocols.http.auto',
+                  'uvicorn.protocols.websockets',
+                  'uvicorn.protocols.websockets.auto',
+                  'sqlalchemy.dialects.sqlite',
+                  'jose.backends',
+                  'passlib.context',
+                  'passlib.handlers.bcrypt',
+                  'llama_cpp',
+              ],
+              hookspath=[],
+              runtime_hooks=[],
+              excludes=[
+                  'torch', 'torchvision', 'torchaudio',
+                  'sentence_transformers', 'transformers', 'faiss',
+                  'numpy.core._multiarray_umath',  # Optional: reduce size
+              ],
+              win_no_prefer_redirects=False,
+              win_private_assemblies=False,
+              cipher=block_cipher,
+          )
+
+          pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
+          exe = EXE(
+              pyz,
+              a.scripts,
+              a.binaries,
+              a.zipfiles,
+              a.datas,
+              [],
+              name='PhysicsChatbotServer',
+              debug=False,
+              bootloader_ignore_signals=False,
+              strip=False,
+              upx=True,
+              console=True,
+              icon=None,
+              version='version.txt'  # Optional: create below
+          )
+          EOF
+
+          # Optional: version file
+          echo "# Version file" > version.txt
+          echo "VSVersionInfo(" >> version.txt
+          echo "  ffi.FixedFileInfo(" >> version.txt
+          echo "    filevers=(1, 0, 0, 0)," >> version.txt
+          echo "    prodvers=(1, 0, 0, 0)," >> version.txt
+          echo "  )," >> version.txt
+          echo "  ffi.StringTable(" >> version.txt
+          echo "    u'040904B0'," >> version.txt
+          echo "    ffi.StringStruct(u'CompanyName', u'xAI Ghana')," >> version.txt
+          echo "    ffi.StringStruct(u'FileDescription', u'Physics Chatbot Server')," >> version.txt
+          echo "    ffi.StringStruct(u'FileVersion', u'1.0.0')," >> version.txt
+          echo "    ffi.StringStruct(u'ProductName', u'PhysicsChatbot')," >> version.txt
+          echo "    ffi.StringStruct(u'ProductVersion', u'1.0.0')" >> version.txt
+          echo "  )" >> version.txt
+          echo ")" >> version.txt
+
+      # -------------------------------------------------
+      # 8. Build EXE with PyInstaller
+      # -------------------------------------------------
+      - name: Build EXE
+        shell: bash
+        run: |
+          pyinstaller FullServer.spec --clean --noconfirm --log-level=INFO
+          if [ ! -f "dist/PhysicsChatbotServer.exe" ]; then
+            echo "EXE build failed!"
+            exit 1
+          fi
+          echo "EXE built successfully."
+
+      # -------------------------------------------------
+      # 9. Create distribution ZIP
+      # -------------------------------------------------
+      - name: Package distribution
+        shell: powershell
+        run: |
+          Compress-Archive -Path `
+            "dist/PhysicsChatbotServer.exe", `
+            "models", `
+            "data" `
+            -DestinationPath "PhysicsChatbotServer-Windows.zip" -Force
+          Write-Host "ZIP created: PhysicsChatbotServer-Windows.zip"
+
+      # -------------------------------------------------
+      # 10. Restore Google Drive token (cached)
+      # -------------------------------------------------
+      - name: Restore token.pickle
+        uses: actions/cache@v4
+        with:
+          path: token.pickle
+          key: drive-token-${{ github.run_id }}
+          restore-keys: |
+            drive-token-
+
+      # -------------------------------------------------
+      # 11. Upload to Google Drive
+      # -------------------------------------------------
+      - name: Upload to Google Drive
+        env:
+          GDRIVE_CLIENT_SECRET_JSON: ${{ secrets.GDRIVE_CLIENT_SECRET_JSON }}
+          DRIVE_FOLDER_ID: ${{ env.DRIVE_FOLDER_ID }}
+        shell: bash
+        run: |
+          # Create upload script if not present
+          if [ ! -f "upload_artifact_to_drive.py" ]; then
+            cat > upload_artifact_to_drive.py << 'PY'
+          import os
+          import pickle
+          from google.auth.transport.requests import Request
+          from google_auth_oauthlib.flow import InstalledAppFlow
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaFileUpload
+
+          SCOPES = ['https://www.googleapis.com/auth/drive.file']
+          CLIENT_SECRET = os.getenv('GDRIVE_CLIENT_SECRET_JSON')
+          FOLDER_ID = os.getenv('DRIVE_FOLDER_ID')
+          FILE_PATH = 'PhysicsChatbotServer-Windows.zip'
+
+          def get_service():
+              creds = None
+              if os.path.exists('token.pickle'):
+                  with open('token.pickle', 'rb') as token:
+                      creds = pickle.load(token)
+              if not creds or not creds.valid:
+                  if creds and creds.expired and creds.refresh_token:
+                      creds.refresh(Request())
+                  else:
+                      import json, io
+                      flow = InstalledAppFlow.from_client_config(
+                          json.loads(CLIENT_SECRET), SCOPES)
+                      creds = flow.run_local_server(port=0)
+                  with open('token.pickle', 'wb') as token:
+                      pickle.dump(creds, token)
+              return build('drive', 'v3', credentials=creds)
+
+          service = get_service()
+          file_metadata = {
+              'name': os.path.basename(FILE_PATH),
+              'parents': [FOLDER_ID]
+          }
+          media = MediaFileUpload(FILE_PATH, resumable=True)
+          file = service.files().create(
+              body=file_metadata, media_body=media, fields='id').execute()
+          print(f"Uploaded {FILE_PATH} with ID: {file.get('id')}")
+          PY
+          fi
+
+          python upload_artifact_to_drive.py
+
+      # -------------------------------------------------
+      # 12. Cache token.pickle for next run
+      # -------------------------------------------------
+      - name: Cache token.pickle
+        uses: actions/cache@v4
+        with:
+          path: token.pickle
+          key: drive-token-${{ github.run_id }}
+
+      # -------------------------------------------------
+      # 13. Upload artifact (optional fallback)
+      # -------------------------------------------------
+      # - name: Upload ZIP as GitHub Artifact
+      # uses: actions/upload-artifact@v4
+      #  with:
+      #    name: PhysicsChatbotServer-Windows
+      #    path: PhysicsChatbotServer-Windows.zip
